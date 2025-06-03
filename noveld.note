@@ -1,0 +1,9 @@
+lsb_release -a
+Distributor ID:	Ubuntu
+Description:	Ubuntu 24.04.2 LTS
+Release:	24.04
+Codename:	noble
+===
+sudo apt install inotify-tools
+inotifywait --help
+man inotifywait

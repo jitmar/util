@@ -1,0 +1,12 @@
+[Unit]
+Description=noveld daemon
+After=network.target
+
+[Service]
+ExecStart=/opt/bin/noveld
+Restart=on-failure
+ExecStop=/opt/bin/noveld --kill
+
+[Install]
+WantedBy=multi-user.target
+Alias=noveld.service

@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+
+# https://stackoverflow.com/a/29754866/30583909
+# More safety, by turning some bugs into errors.
+set -o errexit -o pipefail -o noclobber -o nounset
+
+NOVELD_PID=$$
+VERSION="v0.0.1"
+
+NOVEL_FILE=latest
+HOME=${HOME:-/}
+NOVELD_HOME=${NOVELD_HOME:-$HOME/var/noveld}
+NOVELD_PID_FILE=$NOVELD_HOME/pid
+
+INOTIFYWAIT_PPID_LIST=
+INOTIFYWAIT_COPROC_LIST=
+declare -n DIRLIST=X
+
+
+## https://stackoverflow.com/a/29754866/30583909
+## PARSE COMMAND LINE ARGUMENTS BEGIN ##
+
+# ignore errexit with `&& true`
+getopt --test > /dev/null && true
+if [[ $? -ne 4 ]]; then
+    echo '`getopt --test` failed, cannot parse command line arguments.'
+    exit 1
+fi
+
+NOVELD_CONF=${NOVELD_CONF:-/etc/noveld/config}
+KILL=false
+ECHO_HELP=false
+ECHO_VERSION=false
+
+EXIT_CODE=0
+NOVELD_CONF_EXISTS=false
+NOVELD_CONF_PROVIDED=false
+OPTS_PROVIDED=false # The ones with './prog -x|--xyz' syntax
+ARGS_PROVIDED=false # The ones with './prog xyz' syntax, technicaly options
+                    # (OPTS) are also arguments, but here ARGS mean arguments
+                    # without a leading hyphen
+LONGOPTS=
+SHORTOPTS=
+
+# File containing list of directories to be monitored, one directory in each
+# line. Comments using '#' allowed inline and in new lines.
+LONGOPTS+=config:
+SHORTOPTS+=c:
+
+# Kill the service
+LONGOPTS+=,kill
+SHORTOPTS+=k
+
+# Display help text
+LONGOPTS+=,help
+SHORTOPTS+=h
+
+# Display version
+LONGOPTS+=,version
+SHORTOPTS+=v
+
+function echo_help_ {
+  prog=$(basename $0)
+  echo "$prog: $prog [-c|--config <conf>] [-k|--kill] [-h|--help] \
+[-v|--version] [dirlist]
+  Track the latest file in specified directories.
+
+  Options:
+    -c|--config <conf>  Path of configuration file containing list of
+                        directories to be monitored. One directory path in
+                        each line.
+    -k|--kill           Kill '$prog' and clean up.
+    -h|--help           Display this help text.
+    -v|--version        Display current version ($VERSION).
+
+  Arguments:
+    dirlist             Space separated list of directories to be monitored.
+
+  Exit Status:
+    0:  Successful execution
+    1:  getopt (enhanced), required for command line argument parsing, not
+        supported. To be precise 'getopt --test' failed.
+    2:  getopt (enhanced) availabe but failed to parse command line arguments.
+    3:  No argument provided.
+    4:  Programming error i.e. error in implementation."
+}
+
+function handle_no_arg_ {
+  echo "$0 please provide a config file or list of directories."
+  echo_help_
+  exit 3
+}
+
+function programming_error_ {
+  echo "$0 programming error. Args = $@"
+  echo_help_
+  exit 4
+}
+
+function ignore_comments_ {
+  local words=($1)
+  # Assumes no white spaces in the beginning
+  local first_char=${words[0]:0:1}
+  if [[ $first_char == '#' ]]; then
+    return
+  else
+    # Consider only the first entry in each line
+    echo ${words[0]}
+  fi
+}
+
+# -temporarily store output to be able to check for errors
+# -activate quoting/enhanced mode (e.g. by writing out “--options”)
+# -pass arguments only via   -- "$@"   to separate them correctly
+# -if getopt fails, it complains itself to stderr
+PARSED=$(getopt \
+  --options=$SHORTOPTS \
+  --longoptions=$LONGOPTS \
+  --name "$0" -- "$@") || EXIT_CODE=2
+
+if [[ $EXIT_CODE -eq 2 ]]; then
+  echo "$0 getopt failed"
+  exit $EXIT_CODE
+fi
+unset EXIT_CODE
+
+# read getopt’s output this way to handle the quoting right:
+eval set -- "$PARSED"
+unset LONGOPTS SHORTOPTS PARSED
+
+while true; do
+  cmd_arg=$1
+  case "$cmd_arg" in
+    -c|--config)
+      NOVELD_CONF="$2"
+      NOVELD_CONF_PROVIDED=true
+      OPTS_PROVIDED=true
+      shift 2
+      ;;
+    -k|--kill)
+      KILL=true
+      OPTS_PROVIDED=true
+      shift
+      ;;
+    -h|--help)
+      ECHO_HELP=true
+      OPTS_PROVIDED=true
+      shift
+      ;;
+    -v|--version)
+      ECHO_VERSION=true
+      OPTS_PROVIDED=true
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      programming_error_ $@
+  esac
+done
+
+# handle non-option arguments
+if [[ $# -eq 0 ]]; then
+  #if  [[ $OPTS_PROVIDED == false ]]; then
+  #  handle_no_arg_
+  #fi
+  :
+else
+  ARGS_PROVIDED=true
+fi
+
+## PARSE COMMAND LINE ARGUMENTS END ##
+
+
+## DEFINITIONS BEGIN ##
+# Setup event listeners
+function inotifywait_ {
+  local dir_path=$(realpath $1)
+  local coproc_name=coproc_${dir_path//\//_}
+  local coproc_name=${coproc_name//./_}
+  coproc $coproc_name {
+    inotifywait \
+      --monitor \
+      --event modify $dir_path;
+  }
+
+  local coproc_pid_var=${coproc_name}_PID
+  local coproc_pid=${!coproc_pid_var}
+  INOTIFYWAIT_PPID_LIST+=" $coproc_pid"
+  INOTIFYWAIT_COPROC_LIST+=" $coproc_name"
+}
+
+# Create/update soft link to latest file in directory
+function softlink_latest_ {
+  local dir_path=$1
+
+  # https://mywiki.wooledge.org/BashFAQ/099
+  # latest=$(ls -t $dir_path | head -1) # Unsafe
+  local files=($dir_path/*)
+  local latest=${files[0]}
+  for f in ${files[*]}; do
+    if [[ $f -nt $latest ]]; then
+      latest=$f
+    fi
+  done
+
+  ln --symbolic --relative --force $latest $dir_path/$NOVEL_FILE
+}
+
+# Setup 'callbacks'
+function noveld_ {
+  local dir_path=$1
+  for coproc_name in $INOTIFYWAIT_COPROC_LIST; do
+    declare -n inotifywait_fd_list=$coproc_name
+    local name=
+    coproc name {
+      # Wait for notification
+      while read -u ${inotifywait_fd_list[0]}; do
+        # Create/update softlink
+        softlink_latest_ $dir_path
+      done
+    }
+  done
+}
+
+function kill_ {
+  if [[ ! -f $NOVELD_PID_FILE ]]; then
+    echo "$0 seems service is not running"
+  else
+    noveld_pid=$(cat ${NOVELD_PID_FILE})
+    rm -f $NOVELD_PID_FILE
+    kill -TERM -$noveld_pid
+    exit 0
+  fi
+}
+
+function echo_version_ {
+  echo $VERSION
+}
+
+function process_config_ {
+  local noveld_conf=$1
+  if [[ ! -f $noveld_conf ]]; then
+    if [[ $OPTS_PROVIDED == false ]] && [[ $ARGS_PROVIDED == false ]]; then
+      echo "$0 $noveld_conf config not found in default location."
+    elif [[ $NOVELD_CONF_PROVIDED == true ]]; then
+      echo "$0 $noveld_conf config not found in user defined location."
+    fi
+  else
+    NOVELD_CONF_EXISTS=true
+    local dirlist=
+    echo "$0 reading config from $noveld_conf"
+    while read line; do
+      dirlist+=" $(ignore_comments_ $line)"
+    done < $noveld_conf
+
+    DIRLIST=(${DIRLIST[*]} $dirlist)
+  fi
+}
+
+## DEFINITIONS END ##
+
+
+### MAIN SECTION ###
+
+# Command line argument parsing handled separately above
+
+if [[ $ECHO_HELP == true ]]; then
+  echo_help_
+elif [[ $ECHO_VERSION == true ]]; then
+  echo_version_
+elif [[ $KILL == true ]]; then
+  kill_
+else
+  mkdir -p $NOVELD_HOME
+  rm -f $NOVELD_PID_FILE
+  echo $NOVELD_PID > $NOVELD_PID_FILE
+
+  process_config_ $NOVELD_CONF
+  DIRLIST=(${DIRLIST[*]} $@)
+  
+  for dir in ${DIRLIST[*]}; do
+    if [[ ! -d $dir ]]; then
+      echo "$0 cannot monitor $dir, directory doesn't exist"
+    else
+      inotifywait_ $dir
+      noveld_ $dir
+    fi
+  done
+fi
+
+wait $INOTIFYWAIT_PPID_LIST
+rm -f $NOVELD_PID_FILE
+
